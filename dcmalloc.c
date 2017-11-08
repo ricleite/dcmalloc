@@ -82,6 +82,8 @@ void dc_malloc_finalize()
         if (global_alloc_sizes[i] > 0)
             fprintf(f, "Alloc size %u: %zu mallocs\n", i, global_alloc_sizes[i]);
     }
+
+    fclose(f);
 }
 
 void dc_malloc_thread_initialize()
