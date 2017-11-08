@@ -5,6 +5,7 @@
 #include <stdlib.h>
 #include <stdio.h>
 #include <stdint.h>
+#include <stddef.h>
 #include <stdatomic.h>
 
 #include <unistd.h>
@@ -13,7 +14,19 @@
 
 #include "dcmalloc.h"
 
+/*
+ * Begin dcmalloc compile time options
+ */
+
+// print debug-level messages for every malloc hook
 #define DCMALLOC_DEBUG
+// collect thread allocation behavior
+// this requires keeping metadata per allocation (i.e each malloc will require more memory)
+// #define DCMALLOC_COLLECT_THREAD_BEHAVIOR
+
+/*
+ * End dcmalloc compile time options
+ */
 
 #ifdef DCMALLOC_DEBUG
 #define PRINT_DEBUG(STR, ...) \
@@ -38,10 +51,29 @@
 // and then synchronizes it to global data on thread exit
 // can only track exact allocation size up to a number
 // larger allocations are counted on the largest histogram value
+
+// thread local data
+// number of allocations per size
 static _Thread_local size_t alloc_sizes[MAX_HISTOGRAM_ALLOC];
+// number of allocations per size with no cross-thread free
+static _Thread_local size_t alloc_sizes_thread[MAX_HISTOGRAM_ALLOC];
+
+// global data
 static size_t global_alloc_sizes[MAX_HISTOGRAM_ALLOC];
+static size_t global_alloc_sizes_thread[MAX_HISTOGRAM_ALLOC];
 static pthread_mutex_t global_alloc_mutex = PTHREAD_MUTEX_INITIALIZER;
 static int initialized = 0;
+
+// used when tracking per-allocation data
+// need to ensure sizeof(alloc_data) is a multiple of word size
+// https://stackoverflow.com/questions/11130109/c-struct-size-alignment 
+struct alloc_data
+{
+    pthread_t tid;
+    size_t size;
+} DCMALLOC_ATTR(aligned(sizeof(void*)));
+
+typedef struct alloc_data alloc_data;
 
 /*
  * Begin dc_malloc functions.
@@ -54,10 +86,8 @@ void dc_malloc_initialize()
 
     initialized = 1;
     PRINT_DEBUG();
-    // printf("dc_malloc_initialize\n");
     if (atexit(dc_malloc_finalize) != 0)
         PRINT_ERR("cannot set exit function");
-        // printf("dc_malloc_initialize - cannot set exit function\n");
 }
 
 void dc_malloc_finalize()
@@ -67,7 +97,6 @@ void dc_malloc_finalize()
 
     initialized = 0;
     PRINT_DEBUG();
-    // printf("dc_malloc_finalize\n");
 
     FILE* f = fopen(DCMALLOC_OUTPUT_FILE, "w");
     if (!f)
@@ -82,6 +111,15 @@ void dc_malloc_finalize()
         if (global_alloc_sizes[i] > 0)
             fprintf(f, "Alloc size %u: %zu mallocs\n", i, global_alloc_sizes[i]);
     }
+
+#ifdef DCMALLOC_COLLECT_THREAD_BEHAVIOR
+    PRINT_DEBUG("Dumping in-thread free histogram data...");
+    for (uint32_t i = 0; i < MAX_HISTOGRAM_ALLOC; ++i)
+    {
+        if (global_alloc_sizes_thread[i] > 0)
+            fprintf(f, "Alloc size: %u: %zu in-thread frees\n", i, global_alloc_sizes[i]);
+    }
+#endif // DCMALLOC_COLLECT_THREAD_BEHAVIOR
 
     fclose(f);
 }
@@ -100,6 +138,9 @@ void dc_malloc_thread_finalize()
         for (uint32_t i = 0; i < MAX_HISTOGRAM_ALLOC; ++i)
             global_alloc_sizes[i] += alloc_sizes[i];
 
+        for (uint32_t i = 0; i < MAX_HISTOGRAM_ALLOC; ++i)
+            global_alloc_sizes_thread[i] += alloc_sizes_thread[i];
+
         pthread_mutex_unlock(&global_alloc_mutex);
     }
 }
@@ -116,8 +157,21 @@ void* dc_malloc(size_t size)
     static void* (*libc_malloc)(size_t) = NULL;
     if (libc_malloc == NULL)
         libc_malloc = dlsym(RTLD_NEXT, "malloc");
+    
+#ifdef DCMALLOC_COLLECT_THREAD_BEHAVIOR
+    // to keep data per allocation, need to increase allocation size
+    size += sizeof(alloc_data);
+#endif // DCMALLOC_COLLECT_THREAD_BEHAVIOR
 
-    return libc_malloc(size);
+    void* ptr = libc_malloc(size);
+#ifdef DCMALLOC_COLLECT_THREAD_BEHAVIOR
+    alloc_data* data = (alloc_data*)ptr;
+    data->tid = pthread_self();
+    data->size = size - sizeof(alloc_data);
+    ptr = (void*)(ptr + sizeof(alloc_data));
+#endif // DCMALLOC_COLLECT_THREAD_BEHAVIOR
+
+    return ptr;
 }
 
 void dc_free(void* ptr)
@@ -127,6 +181,22 @@ void dc_free(void* ptr)
     static void (*libc_free)(void*) = NULL;
     if (libc_free == NULL)
         libc_free = dlsym(RTLD_NEXT, "free");
+
+#ifdef DCMALLOC_COLLECT_THREAD_BEHAVIOR
+    if (ptr != NULL)
+    {
+        ptr = (void*)(ptr - sizeof(alloc_data));
+        alloc_data* data = (alloc_data*)ptr;
+
+        if (pthread_equal(data->tid, pthread_self()))
+        {
+            if (data->size < MAX_HISTOGRAM_ALLOC)
+                ++alloc_sizes_thread[data->size];
+            else
+                ++alloc_sizes_thread[MAX_HISTOGRAM_ALLOC - 1];
+        }
+    }
+#endif // DCMALLOC_COLLECT_THREAD_BEHAVIOR
 
     return libc_free(ptr);
 }
