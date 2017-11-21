@@ -1,7 +1,8 @@
 
 CC=gcc
-CFLAGS=-shared -fPIC -std=c11 -O2 -Wall
-LDFLAGS=-ldl -pthread
+DFLAGS=-ggdb -g -fno-omit-frame-pointer
+CFLAGS=-shared -fPIC -std=c11 -O2 -Wall $(DFLAGS)
+LDFLAGS=-ldl -pthread $(DFLAGS)
 
 default: dcmalloc.so
 

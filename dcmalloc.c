@@ -6,13 +6,25 @@
 #include <stdio.h>
 #include <stdint.h>
 #include <stddef.h>
+#include <stdbool.h>
 #include <stdatomic.h>
 
 #include <unistd.h>
 
 #include <pthread.h>
 
+#include "defines.h"
 #include "dcmalloc.h"
+
+#define max(a,b) \
+    ({ __typeof__ (a) _a = (a); \
+       __typeof__ (b) _b = (b); \
+       _a > _b ? _a : _b; })
+
+#define min(a,b) \
+    ({ __typeof__ (a) _a = (a); \
+       __typeof__ (b) _b = (b); \
+       _a > _b ? _b : -a; })
 
 /*
  * Begin dcmalloc compile time options
@@ -22,7 +34,7 @@
 #define DCMALLOC_DEBUG
 // collect thread allocation behavior
 // this requires keeping metadata per allocation (i.e each malloc will require more memory)
-// #define DCMALLOC_COLLECT_THREAD_BEHAVIOR
+#define DCMALLOC_COLLECT_THREAD_BEHAVIOR
 
 /*
  * End dcmalloc compile time options
@@ -43,10 +55,10 @@
  * Begin dc_malloc global data
  */
 
-#define MAX_HISTOGRAM_ALLOC 100000
+#define MAX_ALLOC 100000
 #define DCMALLOC_OUTPUT_FILE ".dcmalloc.dat"
 
-// store allocation histogram
+
 // each thread tracks allocation data in thread-local storage
 // and then synchronizes it to global data on thread exit
 // can only track exact allocation size up to a number
@@ -54,23 +66,27 @@
 
 // thread local data
 // number of allocations per size
-static _Thread_local size_t alloc_sizes[MAX_HISTOGRAM_ALLOC];
+static _Thread_local size_t alloc_sizes[MAX_ALLOC];
 // number of allocations per size with no cross-thread free
-static _Thread_local size_t alloc_sizes_thread[MAX_HISTOGRAM_ALLOC];
+static _Thread_local size_t alloc_sizes_thread[MAX_ALLOC];
 
 // global data
-static size_t global_alloc_sizes[MAX_HISTOGRAM_ALLOC];
-static size_t global_alloc_sizes_thread[MAX_HISTOGRAM_ALLOC];
+static size_t global_alloc_sizes[MAX_ALLOC];
+static size_t global_alloc_sizes_thread[MAX_ALLOC];
 static pthread_mutex_t global_alloc_mutex = PTHREAD_MUTEX_INITIALIZER;
 static int initialized = 0;
 
 // used when tracking per-allocation data
 // need to ensure sizeof(alloc_data) is a multiple of word size
 // https://stackoverflow.com/questions/11130109/c-struct-size-alignment 
+struct alloc_data;
+
 struct alloc_data
 {
     pthread_t tid;
     size_t size;
+    // need space for at least a ptr placed before allocation
+    struct alloc_data* pad;
 } DCMALLOC_ATTR(aligned(sizeof(void*)));
 
 typedef struct alloc_data alloc_data;
@@ -106,7 +122,7 @@ void dc_malloc_finalize()
     }
 
     PRINT_DEBUG("Dumping histogram data...");
-    for (uint32_t i = 0; i < MAX_HISTOGRAM_ALLOC; ++i)
+    for (uint32_t i = 0; i < MAX_ALLOC; ++i)
     {
         if (global_alloc_sizes[i] > 0)
             fprintf(f, "Alloc size %u: %zu mallocs\n", i, global_alloc_sizes[i]);
@@ -114,7 +130,7 @@ void dc_malloc_finalize()
 
 #ifdef DCMALLOC_COLLECT_THREAD_BEHAVIOR
     PRINT_DEBUG("Dumping in-thread free histogram data...");
-    for (uint32_t i = 0; i < MAX_HISTOGRAM_ALLOC; ++i)
+    for (uint32_t i = 0; i < MAX_ALLOC; ++i)
     {
         if (global_alloc_sizes_thread[i] > 0)
             fprintf(f, "Alloc size: %u: %zu in-thread frees\n", i, global_alloc_sizes[i]);
@@ -135,28 +151,44 @@ void dc_malloc_thread_finalize()
 
     {
         pthread_mutex_lock(&global_alloc_mutex);
-        for (uint32_t i = 0; i < MAX_HISTOGRAM_ALLOC; ++i)
+        for (uint32_t i = 0; i < MAX_ALLOC; ++i)
             global_alloc_sizes[i] += alloc_sizes[i];
 
-        for (uint32_t i = 0; i < MAX_HISTOGRAM_ALLOC; ++i)
+        for (uint32_t i = 0; i < MAX_ALLOC; ++i)
             global_alloc_sizes_thread[i] += alloc_sizes_thread[i];
 
         pthread_mutex_unlock(&global_alloc_mutex);
     }
 }
 
+
+void build_alloc_data(alloc_data** a, void** ptr,
+        size_t size, size_t alignment)
+{
+    // @todo
+}
+
+void update_ptr(void* ptr, alloc_data* data)
+{
+    ((alloc_data**)ptr)[-1] = data;
+}
+
+// retrieve alloc_data from free'd ptr
+alloc_data* ptr2data(void* ptr)
+{
+    // | alloc_data | ... | ptr | alloc ... |
+    // a ptr to alloc data is located on the word before alloc
+    return ((alloc_data**)ptr)[-1];
+}
+
 void* dc_malloc(size_t size)
 {
-    // printf("dc_malloc(%zu)\n", size);
-
-    if (size < MAX_HISTOGRAM_ALLOC)
-        ++alloc_sizes[size];
-    else
-        ++alloc_sizes[MAX_HISTOGRAM_ALLOC - 1];
-
     static void* (*libc_malloc)(size_t) = NULL;
     if (libc_malloc == NULL)
         libc_malloc = dlsym(RTLD_NEXT, "malloc");
+
+    size_t true_size = size;
+    ++alloc_sizes[min(true_size, MAX_ALLOC - 1)];
     
 #ifdef DCMALLOC_COLLECT_THREAD_BEHAVIOR
     // to keep data per allocation, need to increase allocation size
@@ -164,11 +196,16 @@ void* dc_malloc(size_t size)
 #endif // DCMALLOC_COLLECT_THREAD_BEHAVIOR
 
     void* ptr = libc_malloc(size);
+    if (ptr == NULL)
+        return ptr;
+
 #ifdef DCMALLOC_COLLECT_THREAD_BEHAVIOR
     alloc_data* data = (alloc_data*)ptr;
     data->tid = pthread_self();
-    data->size = size - sizeof(alloc_data);
+    data->size = true_size;
+
     ptr = (void*)(ptr + sizeof(alloc_data));
+    update_ptr(ptr, data);
 #endif // DCMALLOC_COLLECT_THREAD_BEHAVIOR
 
     return ptr;
@@ -176,8 +213,6 @@ void* dc_malloc(size_t size)
 
 void dc_free(void* ptr)
 {
-    // printf("dc_free(%p)\n", ptr);
-
     static void (*libc_free)(void*) = NULL;
     if (libc_free == NULL)
         libc_free = dlsym(RTLD_NEXT, "free");
@@ -185,20 +220,236 @@ void dc_free(void* ptr)
 #ifdef DCMALLOC_COLLECT_THREAD_BEHAVIOR
     if (ptr != NULL)
     {
-        ptr = (void*)(ptr - sizeof(alloc_data));
-        alloc_data* data = (alloc_data*)ptr;
+        alloc_data* data = ptr2data(ptr);
+        ptr = (void*)data;
 
-        if (pthread_equal(data->tid, pthread_self()))
-        {
-            if (data->size < MAX_HISTOGRAM_ALLOC)
-                ++alloc_sizes_thread[data->size];
-            else
-                ++alloc_sizes_thread[MAX_HISTOGRAM_ALLOC - 1];
-        }
+        ++alloc_sizes_thread[min(data->size, MAX_ALLOC - 1)];
     }
 #endif // DCMALLOC_COLLECT_THREAD_BEHAVIOR
 
     return libc_free(ptr);
+}
+
+void* dc_calloc(size_t n, size_t size)
+{
+    static void* (*libc_calloc)(size_t, size_t) = NULL;
+    if (libc_calloc == NULL)
+        libc_calloc = dlsym(RTLD_NEXT, "calloc");
+
+    // @todo: same error checking as calloc
+    size_t true_size = n * size;
+    ++alloc_sizes[min(true_size, MAX_ALLOC - 1)];
+
+#ifdef DCMALLOC_COLLECT_THREAD_BEHAVIOR
+    // to keep data per allocation, need to increase allocation size
+    n += size / sizeof(alloc_data) + 1;
+#endif // DCMALLOC_COLLECT_THREAD_BEHAVIOR
+
+    void* ptr = libc_calloc(n, size);
+    if (ptr == NULL)
+        return ptr;
+
+#ifdef DCMALLOC_COLLECT_THREAD_BEHAVIOR
+    alloc_data* data = (alloc_data*)ptr;
+    data->tid = pthread_self();
+    data->size = true_size;
+
+    ptr = (void*)(ptr + sizeof(alloc_data));
+    update_ptr(ptr, data);
+#endif // DCMALLOC_COLLECT_THREAD_BEHAVIOR
+
+    return ptr;
+}
+
+void* dc_realloc(void* ptr, size_t size)
+{
+    static void* (*libc_realloc)(void*, size_t) = NULL;
+    if (libc_realloc == NULL)
+        libc_realloc = dlsym(RTLD_NEXT, "realloc");
+
+    if (ptr == NULL)
+        return ptr;
+
+    size_t true_size = size;
+    ++alloc_sizes[min(true_size, MAX_ALLOC - 1)];
+    
+#ifdef DCMALLOC_COLLECT_THREAD_BEHAVIOR
+    // to keep data per allocation, need to increase allocation size
+    size += sizeof(alloc_data);
+    ptr = (void*)ptr2data(ptr);
+#endif // DCMALLOC_COLLECT_THREAD_BEHAVIOR
+
+    void* new_ptr = libc_realloc(ptr, size);
+    if (new_ptr == NULL)
+        return new_ptr;
+
+#ifdef DCMALLOC_COLLECT_THREAD_BEHAVIOR
+    alloc_data* data = (alloc_data*)new_ptr;
+    data->tid = pthread_self();
+    data->size = true_size;
+
+    new_ptr = (void*)(new_ptr + sizeof(alloc_data));
+    update_ptr(new_ptr, data);
+#endif // DCMALLOC_COLLECT_THREAD_BEHAVIOR
+
+    return new_ptr;
+}
+
+int dc_posix_memalign(void** memptr, size_t alignment, size_t size)
+{
+    static int (*libc_posix_memalign)(void**, size_t, size_t) = NULL;
+    if (libc_posix_memalign == NULL)
+        libc_posix_memalign = dlsym(RTLD_NEXT, "posix_memalign");
+
+    size_t true_size = size;
+    ++alloc_sizes[min(true_size, MAX_ALLOC - 1)];
+
+#ifdef DCMALLOC_COLLECT_THREAD_BEHAVIOR
+    // to keep data per allocation, need to increase allocation size
+    size_t offset = (sizeof(alloc_data) / alignment + 1) * sizeof(alloc_data);
+    size += offset;
+#endif // DCMALLOC_COLLECT_THREAD_BEHAVIOR
+
+    int ret = libc_posix_memalign(memptr, alignment, size);
+    if (ret || *memptr == NULL)
+        return ret;
+
+#ifdef DCMALLOC_COLLECT_THREAD_BEHAVIOR
+    void* ptr = *memptr;
+    alloc_data* data = (alloc_data*)ptr;
+    data->tid = pthread_self();
+    data->size = true_size;
+
+    ptr = (void*)(ptr + offset);
+    update_ptr(ptr, data);
+    *memptr = ptr;
+#endif // DCMALLOC_COLLECT_THREAD_BEHAVIOR
+
+    return ret;
+}
+
+void* dc_aligned_alloc(size_t alignment, size_t size)
+{
+    static void* (*libc_aligned_alloc)(size_t, size_t) = NULL;
+    if (libc_aligned_alloc == NULL)
+        libc_aligned_alloc = dlsym(RTLD_NEXT, "aligned_alloc");
+
+    size_t true_size = size;
+    ++alloc_sizes[min(true_size, MAX_ALLOC - 1)];
+
+#ifdef DCMALLOC_COLLECT_THREAD_BEHAVIOR
+    // to keep data per allocation, need to increase allocation size
+    size_t offset = (sizeof(alloc_data) / alignment + 1) * sizeof(alloc_data);
+    size += offset;
+#endif // DCMALLOC_COLLECT_THREAD_BEHAVIOR
+
+    void* ptr = libc_aligned_alloc(alignment, size);
+    if (ptr == NULL)
+        return ptr;
+
+#ifdef DCMALLOC_COLLECT_THREAD_BEHAVIOR
+    alloc_data* data = (alloc_data*)ptr;
+    data->tid = pthread_self();
+    data->size = true_size;
+
+    ptr = (void*)(ptr + offset);
+    update_ptr(ptr, data);
+#endif // DCMALLOC_COLLECT_THREAD_BEHAVIOR
+
+    return ptr;
+}
+
+void* dc_valloc(size_t size)
+{
+    static void* (*libc_valloc)(size_t) = NULL;
+    if (libc_valloc == NULL)
+        libc_valloc = dlsym(RTLD_NEXT, "aligned_alloc");
+
+    size_t true_size = size;
+    ++alloc_sizes[min(true_size, MAX_ALLOC - 1)];
+
+#ifdef DCMALLOC_COLLECT_THREAD_BEHAVIOR
+    // to keep data per allocation, need to increase allocation size
+    size_t offset = (sizeof(alloc_data) / PAGE + 1) * sizeof(alloc_data);
+    size += offset;
+#endif // DCMALLOC_COLLECT_THREAD_BEHAVIOR
+
+    void* ptr = libc_valloc(size);
+    if (ptr == NULL)
+        return ptr;
+
+#ifdef DCMALLOC_COLLECT_THREAD_BEHAVIOR
+    alloc_data* data = (alloc_data*)ptr;
+    data->tid = pthread_self();
+    data->size = true_size;
+
+    ptr = (void*)(ptr + offset);
+    update_ptr(ptr, data);
+#endif // DCMALLOC_COLLECT_THREAD_BEHAVIOR
+
+    return ptr;
+}
+
+void* dc_memalign(size_t alignment, size_t size)
+{
+    static void* (*libc_memalign)(size_t, size_t) = NULL;
+    if (libc_memalign == NULL)
+        libc_memalign = dlsym(RTLD_NEXT, "alignment");
+
+    size_t true_size = size;
+    ++alloc_sizes[min(true_size, MAX_ALLOC - 1)];
+
+#ifdef DCMALLOC_COLLECT_THREAD_BEHAVIOR
+    // to keep data per allocation, need to increase allocation size
+    size_t offset = (sizeof(alloc_data) / alignment + 1) * sizeof(alloc_data);
+    size += offset;
+#endif // DCMALLOC_COLLECT_THREAD_BEHAVIOR
+
+    void* ptr = libc_memalign(alignment, size);
+    if (ptr == NULL)
+        return ptr;
+
+#ifdef DCMALLOC_COLLECT_THREAD_BEHAVIOR
+    alloc_data* data = (alloc_data*)ptr;
+    data->tid = pthread_self();
+    data->size = true_size;
+
+    ptr = (void*)(ptr + offset);
+    update_ptr(ptr, data);
+#endif // DCMALLOC_COLLECT_THREAD_BEHAVIOR
+
+    return ptr;
+}
+
+void* dc_pvalloc(size_t size)
+{
+    static void* (*libc_pvalloc)(size_t) = NULL;
+    if (libc_pvalloc == NULL)
+        libc_pvalloc = dlsym(RTLD_NEXT, "pvalloc");
+
+    size_t true_size = size;
+    ++alloc_sizes[min(true_size, MAX_ALLOC - 1)];
+
+#ifdef DCMALLOC_COLLECT_THREAD_BEHAVIOR
+    // to keep data per allocation, need to increase allocation size
+    size_t offset = (sizeof(alloc_data) / PAGE + 1) * sizeof(alloc_data);
+    size += offset;
+#endif // DCMALLOC_COLLECT_THREAD_BEHAVIOR
+
+    void* ptr = libc_pvalloc(size);
+    if (ptr == NULL)
+        return ptr;
+
+#ifdef DCMALLOC_COLLECT_THREAD_BEHAVIOR
+    alloc_data* data = (alloc_data*)ptr;
+    data->tid = pthread_self();
+    data->size = true_size;
+
+    ptr = (void*)(ptr + offset);
+    update_ptr(ptr, data);
+#endif // DCMALLOC_COLLECT_THREAD_BEHAVIOR
+
+    return ptr;
 }
 
 /*
@@ -289,28 +540,4 @@ int pthread_create(pthread_t* thread,
     dc_malloc_thread_initialize();
     return pthread_create_fn(thread, attr, thread_initializer, starter_arg);
 }
-
-extern void* malloc(size_t size);
-extern void free(void* ptr);
-
-void* malloc(size_t size)
-{
-    return dc_malloc(size);
-}
-
-void free(void* ptr)
-{
-    return dc_free(ptr);
-}
-
-// glibc hooks
-// overriding malloc/free turns out to be simpler than using glibc hooks
-// DCMALLOC_EXPORT void (*__free_hook)(void *ptr) = dc_free;
-// DCMALLOC_EXPORT void *(*__malloc_hook)(size_t size) = dc_malloc;
-
-
-
-
-
-
 
