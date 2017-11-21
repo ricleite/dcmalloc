@@ -6,8 +6,8 @@ LDFLAGS=-ldl -pthread $(DFLAGS)
 
 default: dcmalloc.so
 
-dcmalloc.so: dcmalloc.c
-	$(CC) $(LDFLAGS) $(CFLAGS) -o dcmalloc.so dcmalloc.c
+dcmalloc.so: dcmalloc.c static_malloc.c
+	$(CC) $(LDFLAGS) $(CFLAGS) -o dcmalloc.so dcmalloc.c static_malloc.c
 
 clean:
 	rm -f *.so

@@ -2,6 +2,7 @@
 #define _GNU_SOURCE
 #include <dlfcn.h>
 
+#include <assert.h>
 #include <stdlib.h>
 #include <stdio.h>
 #include <stdint.h>
@@ -14,6 +15,7 @@
 #include <pthread.h>
 
 #include "defines.h"
+#include "static_malloc.h"
 #include "dcmalloc.h"
 
 #define max(a,b) \
@@ -24,14 +26,14 @@
 #define min(a,b) \
     ({ __typeof__ (a) _a = (a); \
        __typeof__ (b) _b = (b); \
-       _a > _b ? _b : -a; })
+       _a > _b ? _b : _a; })
 
 /*
  * Begin dcmalloc compile time options
  */
 
 // print debug-level messages for every malloc hook
-#define DCMALLOC_DEBUG
+// #define DCMALLOC_DEBUG
 // collect thread allocation behavior
 // this requires keeping metadata per allocation (i.e each malloc will require more memory)
 #define DCMALLOC_COLLECT_THREAD_BEHAVIOR
@@ -45,7 +47,8 @@
     fprintf(stdout, "%s:%d %s " STR "\n", __FILE__, __LINE__, __func__, ##__VA_ARGS__);
 
 #else
-// #define PRINT_DEBUG(str, ...)
+#define PRINT_DEBUG(str, ...)
+
 #endif
 
 #define PRINT_ERR(STR, ...) \
@@ -133,7 +136,10 @@ void dc_malloc_finalize()
     for (uint32_t i = 0; i < MAX_ALLOC; ++i)
     {
         if (global_alloc_sizes_thread[i] > 0)
-            fprintf(f, "Alloc size: %u: %zu in-thread frees\n", i, global_alloc_sizes[i]);
+        {
+            fprintf(f, "Alloc size: %u: %zu in-thread frees\n",
+                    i, global_alloc_sizes_thread[i]);
+        }
     }
 #endif // DCMALLOC_COLLECT_THREAD_BEHAVIOR
 
@@ -152,20 +158,25 @@ void dc_malloc_thread_finalize()
     {
         pthread_mutex_lock(&global_alloc_mutex);
         for (uint32_t i = 0; i < MAX_ALLOC; ++i)
+        {
             global_alloc_sizes[i] += alloc_sizes[i];
-
-        for (uint32_t i = 0; i < MAX_ALLOC; ++i)
             global_alloc_sizes_thread[i] += alloc_sizes_thread[i];
+        }
 
         pthread_mutex_unlock(&global_alloc_mutex);
     }
 }
 
-
-void build_alloc_data(alloc_data** a, void** ptr,
-        size_t size, size_t alignment)
+void update_alloc_counter(size_t size)
 {
-    // @todo
+    if (initialized)
+        ++alloc_sizes[min(size, MAX_ALLOC - 1)];
+}
+
+void update_alloc_thread_counter(alloc_data* data)
+{
+    if (initialized && pthread_equal(pthread_self(), data->tid))
+        ++alloc_sizes_thread[min(data->size, MAX_ALLOC - 1)];
 }
 
 void update_ptr(void* ptr, alloc_data* data)
@@ -188,8 +199,10 @@ void* dc_malloc(size_t size)
         libc_malloc = dlsym(RTLD_NEXT, "malloc");
 
     size_t true_size = size;
-    ++alloc_sizes[min(true_size, MAX_ALLOC - 1)];
-    
+    update_alloc_counter(true_size);
+
+    PRINT_DEBUG("size: %lu", true_size);
+
 #ifdef DCMALLOC_COLLECT_THREAD_BEHAVIOR
     // to keep data per allocation, need to increase allocation size
     size += sizeof(alloc_data);
@@ -217,13 +230,19 @@ void dc_free(void* ptr)
     if (libc_free == NULL)
         libc_free = dlsym(RTLD_NEXT, "free");
 
+    // ptr might have been given by static_malloc
+    if (try_static_free(ptr))
+        return;
+    
+    PRINT_DEBUG("ptr: %p", ptr);
+
 #ifdef DCMALLOC_COLLECT_THREAD_BEHAVIOR
     if (ptr != NULL)
     {
         alloc_data* data = ptr2data(ptr);
         ptr = (void*)data;
 
-        ++alloc_sizes_thread[min(data->size, MAX_ALLOC - 1)];
+        update_alloc_thread_counter(data);
     }
 #endif // DCMALLOC_COLLECT_THREAD_BEHAVIOR
 
@@ -234,11 +253,33 @@ void* dc_calloc(size_t n, size_t size)
 {
     static void* (*libc_calloc)(size_t, size_t) = NULL;
     if (libc_calloc == NULL)
-        libc_calloc = dlsym(RTLD_NEXT, "calloc");
+    {
+        // dlsym itself uses calloc, so we can enter a loop
+        // to break it off, use a static memory allocator for
+        //  dlsym allocations
+        
+        // @todo: gcc bug causes first 'true' write to be optimized out
+        // need to mark variable as volatile
+        static volatile bool fetching_calloc = false;
+        if (!fetching_calloc)
+        {
+            fetching_calloc = true;
+            assert(fetching_calloc == true);
+            libc_calloc = dlsym(RTLD_NEXT, "calloc");
+            fetching_calloc = false;
+        }
+        else
+        {
+            // dc_free also has handling for freeing this ptr
+            return static_calloc(n, size);
+        }
+    }
 
     // @todo: same error checking as calloc
     size_t true_size = n * size;
-    ++alloc_sizes[min(true_size, MAX_ALLOC - 1)];
+    update_alloc_counter(true_size);
+
+    PRINT_DEBUG("size: %lu", true_size);
 
 #ifdef DCMALLOC_COLLECT_THREAD_BEHAVIOR
     // to keep data per allocation, need to increase allocation size
@@ -267,16 +308,16 @@ void* dc_realloc(void* ptr, size_t size)
     if (libc_realloc == NULL)
         libc_realloc = dlsym(RTLD_NEXT, "realloc");
 
-    if (ptr == NULL)
-        return ptr;
-
     size_t true_size = size;
-    ++alloc_sizes[min(true_size, MAX_ALLOC - 1)];
-    
+    update_alloc_counter(true_size);
+
+    PRINT_DEBUG("size: %lu", true_size);
+
 #ifdef DCMALLOC_COLLECT_THREAD_BEHAVIOR
     // to keep data per allocation, need to increase allocation size
     size += sizeof(alloc_data);
-    ptr = (void*)ptr2data(ptr);
+    if (ptr)
+        ptr = (void*)ptr2data(ptr);
 #endif // DCMALLOC_COLLECT_THREAD_BEHAVIOR
 
     void* new_ptr = libc_realloc(ptr, size);
@@ -302,7 +343,9 @@ int dc_posix_memalign(void** memptr, size_t alignment, size_t size)
         libc_posix_memalign = dlsym(RTLD_NEXT, "posix_memalign");
 
     size_t true_size = size;
-    ++alloc_sizes[min(true_size, MAX_ALLOC - 1)];
+    update_alloc_counter(true_size);
+
+    PRINT_DEBUG("size: %lu", true_size);
 
 #ifdef DCMALLOC_COLLECT_THREAD_BEHAVIOR
     // to keep data per allocation, need to increase allocation size
@@ -335,7 +378,9 @@ void* dc_aligned_alloc(size_t alignment, size_t size)
         libc_aligned_alloc = dlsym(RTLD_NEXT, "aligned_alloc");
 
     size_t true_size = size;
-    ++alloc_sizes[min(true_size, MAX_ALLOC - 1)];
+    update_alloc_counter(true_size);
+
+    PRINT_DEBUG("size: %lu", true_size);
 
 #ifdef DCMALLOC_COLLECT_THREAD_BEHAVIOR
     // to keep data per allocation, need to increase allocation size
@@ -366,7 +411,9 @@ void* dc_valloc(size_t size)
         libc_valloc = dlsym(RTLD_NEXT, "aligned_alloc");
 
     size_t true_size = size;
-    ++alloc_sizes[min(true_size, MAX_ALLOC - 1)];
+    update_alloc_counter(true_size);
+
+    PRINT_DEBUG("size: %lu", true_size);
 
 #ifdef DCMALLOC_COLLECT_THREAD_BEHAVIOR
     // to keep data per allocation, need to increase allocation size
@@ -394,10 +441,12 @@ void* dc_memalign(size_t alignment, size_t size)
 {
     static void* (*libc_memalign)(size_t, size_t) = NULL;
     if (libc_memalign == NULL)
-        libc_memalign = dlsym(RTLD_NEXT, "alignment");
+        libc_memalign = dlsym(RTLD_NEXT, "memalign");
 
     size_t true_size = size;
-    ++alloc_sizes[min(true_size, MAX_ALLOC - 1)];
+    update_alloc_counter(true_size);
+
+    PRINT_DEBUG("size: %lu", true_size);
 
 #ifdef DCMALLOC_COLLECT_THREAD_BEHAVIOR
     // to keep data per allocation, need to increase allocation size
@@ -428,7 +477,9 @@ void* dc_pvalloc(size_t size)
         libc_pvalloc = dlsym(RTLD_NEXT, "pvalloc");
 
     size_t true_size = size;
-    ++alloc_sizes[min(true_size, MAX_ALLOC - 1)];
+    update_alloc_counter(true_size);
+
+    PRINT_DEBUG("size: %lu", true_size);
 
 #ifdef DCMALLOC_COLLECT_THREAD_BEHAVIOR
     // to keep data per allocation, need to increase allocation size
@@ -462,7 +513,6 @@ void* dc_pvalloc(size_t size)
 
 // handle process init/exit hooks
 static pthread_key_t destructor_key;
-static int is_initialized = 0;
 
 static void* thread_initializer(void*);
 static void thread_finalizer(void*);
@@ -470,13 +520,14 @@ static void thread_finalizer(void*);
 static DCMALLOC_ATTR(constructor)
 void initializer()
 {
-    if (!is_initialized)
+    static int is_initialized = 0;
+    if (is_initialized == 0)
     {
         is_initialized = 1;
         pthread_key_create(&destructor_key, thread_finalizer);
-        dc_malloc_initialize();
     }
 
+    dc_malloc_initialize();
     dc_malloc_thread_initialize();
 }
 
@@ -484,12 +535,7 @@ static DCMALLOC_ATTR(destructor)
 void finalizer()
 {
     dc_malloc_thread_finalize();
-
-    if (is_initialized)
-    {
-        is_initialized = 0;
-        dc_malloc_finalize();
-    }
+    dc_malloc_finalize();
 }
 
 // handle thread init/exit hooks
