@@ -1,3 +1,7 @@
+/*
+ * Copyright (C) 2019 Ricardo Leite. All rights reserved.
+ * Licenced under the MIT licence. See COPYING file in the project root for details.
+ */
 
 #define _GNU_SOURCE
 #include <dlfcn.h>
@@ -33,10 +37,11 @@
  */
 
 // print debug-level messages for every malloc hook
-// #define DCMALLOC_DEBUG
+//#define DCMALLOC_DEBUG
+
 // collect thread allocation behavior
 // this requires keeping metadata per allocation (i.e each malloc will require more memory)
-#define DCMALLOC_COLLECT_THREAD_BEHAVIOR
+//#define DCMALLOC_COLLECT_THREAD_BEHAVIOR
 
 /*
  * End dcmalloc compile time options

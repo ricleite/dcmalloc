@@ -1,3 +1,7 @@
+/*
+ * Copyright (C) 2019 Ricardo Leite. All rights reserved.
+ * Licenced under the MIT licence. See COPYING file in the project root for details.
+ */
 
 #ifndef __STATIC_MALLOC_H__
 #define __STATIC_MALLOC_H__
